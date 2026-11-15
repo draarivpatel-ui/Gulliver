@@ -139,6 +139,205 @@ def test_function_on_filter_column():
     assert "GV005" not in rules("select count(*) from events where ts >= '2024-01-01'")
 
 
+def gv005(sql, dialect="duckdb"):
+    stmt = classify(sql, dialect)
+    found = [f for f in lint(stmt.select, dialect) if f.rule == "GV005"]
+    assert len(found) == 1, (sql, dialect, found)
+    return found[0]
+
+
+GV005_MESSAGE = "The filter wraps {} in a function or calculation, which blocks partition pruning and min/max skipping."
+GV005_DIALECTS = ("duckdb", "postgres", "bigquery", "snowflake", "sqlite")
+GV005_FORMAT_DIALECTS = (*GV005_DIALECTS, "mysql")
+
+
+@pytest.mark.parametrize("dialect", GV005_DIALECTS)
+@pytest.mark.parametrize("where, column", [
+    ("date(created_at) = '2024-01-01'", "created_at"),
+    ("cast(created_at as date) = '2024-01-01'", "created_at"),
+    ("{trunc} = '2024-01-01'", "created_at"),
+    ("extract(year from created_at) = 2024", "created_at"),
+])
+def test_gv005_fix_for_date_functions_names_the_column(dialect, where, column):
+    trunc = "date_trunc(created_at, day)" if dialect == "bigquery" else "date_trunc('day', created_at)"
+    f = gv005(f"select a from t where {where.format(trunc=trunc)} limit 5", dialect)
+    assert (f.severity, f.message) == ("warn", GV005_MESSAGE.format(column))
+    assert f.fix == (f"Compare the raw column to a constant range, e.g. {column} >= '2024-01-01' AND "
+                     f"{column} < '2024-01-02' instead of DATE({column}) = '2024-01-01'.")
+
+
+@pytest.mark.parametrize("dialect", GV005_DIALECTS)
+@pytest.mark.parametrize("where", [
+    "amount * 1 > 9007199254740992",  # safe integer-looking factor can still be unsafe by column type/precision
+    "amount * 2 > 1 + 2",             # compound constant must not lose parentheses in any concrete rewrite
+    "amount + 5 = '20'",              # nonnumeric comparison constant must not get broken arithmetic SQL
+    "amount * 1.2 > 100",
+    "100 < amount * 1.2",
+    "amount / 4 <= 10",
+    "amount * -2 > 10",
+    "amount * 0 > 10",
+    "3 - amount > 1",
+    "amount * 2 > other_amount",
+    "amount * 2 between 1 and 5",
+])
+def test_gv005_fix_for_arithmetic_is_safe_general_advice(dialect, where):
+    f = gv005(f"select a from t where {where} limit 5", dialect)
+    assert f.message == GV005_MESSAGE.format("amount")
+    assert "Move the constant arithmetic to the other side of the comparison when types and overflow allow" in f.fix
+    assert "raw column amount" in f.fix
+    assert "Do not emit a concrete rewritten comparison" in f.fix
+    assert "amount > 9007199254740992 / 1.0" not in f.fix
+    assert "1 + 2 / 2.0" not in f.fix
+    assert "amount = '20' - 5" not in f.fix
+
+
+@pytest.mark.parametrize("dialect", GV005_DIALECTS)
+@pytest.mark.parametrize("where", [
+    "coalesce(n, 1) = 1.00000000000000001",
+    "coalesce(n, 0e0) = 9007199254740993",
+    "coalesce(n, '0') = '0'",
+    "coalesce(status, 'x') = 'x'",
+    "coalesce(status, 'x') = 'y'",
+])
+def test_gv005_fix_for_coalesce_is_safe_general_advice(dialect, where):
+    column = "status" if "status" in where else "n"
+    f = gv005(f"select a from t where {where} limit 5", dialect)
+    assert f.message == GV005_MESSAGE.format(column)
+    assert f"Compare the raw column {column} directly and handle NULL explicitly" in f.fix
+    assert "Do not drop COALESCE" in f.fix
+    assert "IS NULL" not in f.fix and "IS NOT NULL" not in f.fix
+    assert "(n = " not in f.fix and "(status = " not in f.fix
+
+
+@pytest.mark.parametrize("dialect", GV005_DIALECTS)
+def test_gv005_fix_for_case_functions_preserves_exact_transformation(dialect):
+    f_upper = gv005("select a from t where upper(name) like 'A%' limit 5", dialect)
+    assert f_upper.message == GV005_MESSAGE.format("name")
+    assert "ILIKE" not in f_upper.fix
+    assert "UPPER(name) runs on every row and forces a full scan." in f_upper.fix
+    assert "precomputed upper-case copy of name (UPPER(name))" in f_upper.fix
+    assert "lower-case" not in f_upper.fix
+
+    f_lower = gv005("select a from t where lower(name) = 'a' limit 5", dialect)
+    assert f_lower.message == GV005_MESSAGE.format("name")
+    assert "ILIKE" not in f_lower.fix
+    assert "LOWER(name) runs on every row and forces a full scan." in f_lower.fix
+    assert "precomputed lower-case copy of name (LOWER(name))" in f_lower.fix
+    assert "upper-case" not in f_lower.fix
+
+    f_pat = gv005("select a from t where 'ALICE' like upper(pattern) limit 5", dialect)
+    assert "ILIKE" not in f_pat.fix
+    assert "precomputed upper-case copy of pattern (UPPER(pattern))" in f_pat.fix
+    assert "operand order" in f_pat.fix
+
+
+@pytest.mark.parametrize("dialect", GV005_DIALECTS)
+def test_gv005_fix_for_trim(dialect):
+    f = gv005("select a from t where trim(name) = 'x' limit 5", dialect)
+    assert f.fix.startswith("TRIM(name) runs on every row and forces a full scan.") and "ILIKE" not in f.fix
+    assert "type affinity" in f.fix
+    f_opts = gv005("select a from t where trim(code, '0') = '1' limit 5", dialect)
+    assert "ILIKE" not in f_opts.fix
+    assert "TRIM(code) runs on every row" not in f_opts.fix
+    assert "'0'" in f_opts.fix
+
+
+@pytest.mark.parametrize("dialect", GV005_FORMAT_DIALECTS)
+@pytest.mark.parametrize("where, column", [
+    ("to_char(amount, 'FM999MI') = '123'", "amount"),
+    ("to_char(amount, 'FM999%MI') = '123'", "amount"),
+    ("to_char(amount, '999%%') = '123'", "amount"),
+    ("to_char(amt, '999D99') = '123.45'", "amt"),
+    ("to_char(amount, '999TH') = '123RD'", "amount"),
+    ("to_char(amount, '990') = '123'", "amount"),
+    ("to_char(amount, '999.00') = '123.45'", "amount"),
+    ("to_char(amount, '%M99') = '123'", "amount"),
+    ("to_char(amount, '%u99') = '123'", "amount"),
+    ("to_char(amount, '%OM99') = '123'", "amount"),
+    ("to_char(amount, '%Ou99') = '123'", "amount"),
+    ("to_char(amount, 'FM999\"YYYY\"') = '123'", "amount"),
+    ("to_char(amount, 'FM999\"YYYYMMDD\"') = '123'", "amount"),
+    ("to_char(amount, 'MI') = '-'", "amount"),
+    ("to_char(amount, 'D') = '1'", "amount"),
+    ("to_char(amount, '%M') = '1'", "amount"),
+    ("to_char(amount, '%u') = '1'", "amount"),
+    ("to_char(amount, '%OM') = '1'", "amount"),
+    ("to_char(amount, '%Ou') = '1'", "amount"),
+    ("to_char(x, 'JSON') = '1'", "x"),
+    ('to_char(amount, \'"label \\\"MM\\\""999\') = \'1\'', "amount"),
+])
+def test_gv005_numeric_quoted_and_unknown_tochar_formats_do_not_get_date_advice(dialect, where, column):
+    f = gv005(f"select a from t where {where} limit 5", dialect)
+    assert f.message == GV005_MESSAGE.format(column)
+    assert "constant range" not in f.fix
+    assert "DATE(" not in f.fix
+    assert "2024-01-01" not in f.fix
+    assert f.fix == (f"Compare the raw column {column} where possible, or filter on a partition or indexed column first "
+                     "so less data is read.")
+
+
+@pytest.mark.parametrize("dialect", GV005_FORMAT_DIALECTS)
+@pytest.mark.parametrize("fmt", ["%a", "%B", "%Y-%m-%d", "%Y-%m-%d 00:00", "%-d", "%02m-%d 09:00", "%M99", "%u99"])
+def test_gv005_timetostr_temporal_directives_keep_date_advice(dialect, fmt):
+    f = gv005(f"select a from t where strftime(ts, '{fmt}') = 'x' limit 5", dialect)
+    assert f.message == GV005_MESSAGE.format("ts")
+    assert f.fix == ("Compare the raw column to a constant range, e.g. ts >= '2024-01-01' AND "
+                     "ts < '2024-01-02' instead of DATE(ts) = '2024-01-01'.")
+
+
+@pytest.mark.parametrize("dialect", GV005_FORMAT_DIALECTS)
+@pytest.mark.parametrize("fmt", ["%Y-%m-%d 00:00", "%-d"])
+def test_gv005_format_timestamp_with_literals_and_flags_keeps_date_advice(dialect, fmt):
+    f = gv005(f"select a from t where format_timestamp('{fmt}', ts) = 'x' limit 5", dialect)
+    assert f.message == GV005_MESSAGE.format("ts")
+    assert f.fix == ("Compare the raw column to a constant range, e.g. ts >= '2024-01-01' AND "
+                     "ts < '2024-01-02' instead of DATE(ts) = '2024-01-01'.")
+
+
+@pytest.mark.parametrize("dialect", GV005_FORMAT_DIALECTS)
+@pytest.mark.parametrize("fmt", [
+    "YYYY-MM-DD", "YYYY-MM-DD 00:00", "DDTH", "DDTH Month YYYY", "MONTH", "YYYYMMDD", "HH24MISS",
+    "YYYYMMDDHH24MISS", "YYYYMMDDHH24MISSFF0", "HH24MISSFF0", "YYYYMMDDHH24MISSFF6",
+    "YYYY_MM_DD", "HH24_MI_SS", "FMYYYYMMDD", "FMDDTHMonthYYYY", "yyyymmdd", "hh24miss",
+])
+def test_gv005_to_char_temporal_format_keeps_date_advice(dialect, fmt):
+    f = gv005(f"select a from t where to_char(created_at, '{fmt}') = 'x' limit 5", dialect)
+    assert f.fix == ("Compare the raw column to a constant range, e.g. created_at >= '2024-01-01' AND "
+                     "created_at < '2024-01-02' instead of DATE(created_at) = '2024-01-01'.")
+
+
+@pytest.mark.parametrize("dialect", GV005_FORMAT_DIALECTS)
+@pytest.mark.parametrize("expr", [
+    "to_char(cast(created_at as timestamp), 'MI')",
+    "to_char(date(created_at), 'MI')",
+    "to_char(cast(created_at as date), 'D')",
+    "to_char(cast(created_at as timestamp), '%M')",
+])
+def test_gv005_to_char_ambiguous_format_with_temporal_operand_keeps_date_advice(dialect, expr):
+    f = gv005(f"select a from t where {expr} = '1' limit 5", dialect)
+    assert f.fix == ("Compare the raw column to a constant range, e.g. created_at >= '2024-01-01' AND "
+                     "created_at < '2024-01-02' instead of DATE(created_at) = '2024-01-01'.")
+
+
+@pytest.mark.parametrize("dialect", GV005_DIALECTS)
+@pytest.mark.parametrize("where", [
+    "substr(code, 1, 2) = 'NL'", "cast(code as int) = 3", "length(code) > 3",
+])
+def test_gv005_fix_for_other_functions_is_neutral(dialect, where):
+    f = gv005(f"select a from t where {where} limit 5", dialect)
+    assert f.message == GV005_MESSAGE.format("code")
+    assert f.fix == ("Compare the raw column code where possible, or filter on a partition or indexed column first "
+                     "so less data is read.")
+
+
+@pytest.mark.parametrize("where", ["upper(name) like 'A%'", "amount * 1.2 > 100", "coalesce(status, 'x') = 'x'",
+                                   "substr(code, 1, 2) = 'NL'", "trim(name) = 'x'", "amount * -2 > 10"])
+def test_gv005_fix_mentions_no_date_unless_the_filter_is_about_time(where):
+    for dialect in GV005_DIALECTS:
+        fix = gv005(f"select a from t where {where} limit 5", dialect).fix
+        assert "ts" not in fix.split() and "2024" not in fix and "DATE" not in fix, (where, dialect, fix)
+
+
 def test_order_without_limit():
     assert rules("select id from events order by id")["GV006"] == "warn"
 

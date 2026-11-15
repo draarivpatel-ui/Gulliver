@@ -8,6 +8,7 @@ Every rule has a stable id (GV001...), a severity and a concrete fix.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -123,6 +124,188 @@ def _on_link(on: exp.Expression) -> str:
         if len(tables) >= 2:
             return "ok"
     return "unlinked"
+
+
+# GV005: the fix advice depends on what wraps the filtered column
+_GV005_DATE_FUNCS = (exp.Date, exp.TsOrDsToDate, exp.DateTrunc, exp.TimestampTrunc, exp.DatetimeTrunc, exp.Year,
+                     exp.Month, exp.Day, exp.Extract)
+_GV005_DATE_NAMES = {"DATE", "DATE_TRUNC", "DATETRUNC", "YEAR", "MONTH", "DAY", "EXTRACT", "STRFTIME", "FORMAT_DATE",
+                     "FORMAT_TIMESTAMP", "TO_DATE"}
+_GV005_DATE_TYPES = (exp.DataType.Type.DATE, exp.DataType.Type.DATETIME, exp.DataType.Type.TIMESTAMP,
+                     exp.DataType.Type.TIMESTAMPTZ, exp.DataType.Type.TIMESTAMPLTZ, exp.DataType.Type.TIMESTAMPNTZ)
+_GV005_ARITHMETIC = (exp.Add, exp.Sub, exp.Mul, exp.Div)
+_GV005_TOCHAR_TYPES = tuple(cls for cls in (getattr(exp, "TimeToStr", None), getattr(exp, "ToChar", None)) if cls)
+
+
+# Number-format tokens in TO_CHAR. `9` and `0` are digit placeholders; `RN`, `EEEE`, etc. are
+# numeric format modifiers. (`FM`/`TH` can also modify date elements like `FMMonth`/`DDTH`.)
+_GV005_TOCHAR_NUMERIC_MARKERS = re.compile(r"\b(?:FM|RN|EEEE|SG|PL|PR|TH|SP|V|FX)\b|\$|[90]", re.IGNORECASE)
+# Tokenize complete TO_CHAR field sequences, including compact formats and date modifiers.
+# `MI` and `D` are ambiguous numeric tokens; only the named group supplies strong date evidence.
+_GV005_TOCHAR_TEMPORAL_TOKEN = re.compile(
+    r"(?P<strong>YYYY|IYYY|YYY|YY|Y|RRRR|RR|MONTH|MON|MM|DAY|DY|DDD|DD|HH24|HH12|HH|SS|MS|US|FF[0-9]?|AM|PM|"
+    r"TZH|TZM|TZ|OF|WW|IW|W|Q|J|CC|SCC|ID)|MI|D|FM|FX|THSP|SPTH|TH|SP",
+    re.IGNORECASE,
+)
+_GV005_STRFTIME_DIRECTIVE = re.compile(r"%[-_0#^]?[0-9]*(?:E|O)?[a-zA-Z%+]")
+_GV005_STRFTIME_NAMES = {"STRFTIME", "FORMAT_DATE", "FORMAT_TIMESTAMP"}
+
+
+def _gv005_format_arg(operand: exp.Expression) -> str | None:
+    fmt = operand.args.get("format")
+    if not (isinstance(fmt, exp.Literal) and fmt.is_string):
+        # SQLite parses `strftime(ts, '%a')` with the arguments swapped: the literal lives in
+        # `this` (inside a TsOrDsToTimestamp) and the column in `format`. Recover the literal.
+        inner = operand.args.get("this")
+        if isinstance(inner, exp.TsOrDsToTimestamp):
+            inner = inner.this
+        fmt = inner if isinstance(inner, exp.Literal) and inner.is_string else fmt
+    if not (isinstance(fmt, exp.Literal) and fmt.is_string) and isinstance(operand, exp.Anonymous) \
+            and len(operand.expressions) >= 2:
+        name = str(operand.name).upper()
+        fmt = operand.expressions[0] if name in {"FORMAT_DATE", "FORMAT_TIMESTAMP"} else operand.expressions[1]
+    if isinstance(fmt, exp.Literal) and fmt.is_string:
+        return fmt.this
+    return None
+
+
+def _gv005_strip_quoted_literals(fmt: str) -> str:
+    return re.sub(r'"(?:\\.|[^"\\])*"', "", fmt)
+
+
+_GV005_COMBINED_TEMPORAL_TOKEN = re.compile(
+    rf"(?P<directive>{_GV005_STRFTIME_DIRECTIVE.pattern})|{_GV005_TOCHAR_TEMPORAL_TOKEN.pattern}",
+    re.IGNORECASE,
+)
+
+
+def _gv005_tochar_has_strong_temporal(fmt: str) -> bool:
+    """Return True when `fmt` has a complete unambiguous temporal word or strftime directive."""
+    for word in re.findall(r"(?:%[-_0#^]?[0-9]*(?:E|O)?[a-zA-Z+]|[A-Za-z0-9])+", fmt):
+        if word.isdigit():
+            continue
+        tokens = list(_GV005_COMBINED_TEMPORAL_TOKEN.finditer(word))
+        if "".join(token.group() for token in tokens) != word:
+            continue
+        for token in tokens:
+            if token.lastgroup == "strong" or (
+                token.lastgroup == "directive" and token.group()[-1] not in {"M", "u"}
+            ):
+                return True
+    return False
+
+
+def _gv005_temporal_format(fmt: str | None) -> bool | None:
+    """Classify a TO_CHAR format. True=temporal, False=numeric, None=ambiguous/unknown.
+
+    Quoted spans are stripped as literals. Complete temporal field sequences (`YYYYMMDD`,
+    `HH24MISS`, `DDTH`, `MONTH`, ...) and unambiguous normalized directives (`%Y`, `%d`, ...)
+    identify date/time formats without matching partial unknown words like `YYYYFOO` (`%YFOO`).
+    Ambiguous tokens like bare `MI`/`%M`/`%u`/`D` return None so callers rely on the operand type.
+    """
+    if fmt is None:
+        return None
+    cleaned = re.sub(r"%%", "", _gv005_strip_quoted_literals(fmt))
+    if _gv005_tochar_has_strong_temporal(cleaned):
+        return True
+    without_directives = _GV005_STRFTIME_DIRECTIVE.sub("", cleaned)
+    if _GV005_TOCHAR_NUMERIC_MARKERS.search(without_directives):
+        return False
+    return None
+
+
+def _gv005_tochar_value_arg(operand: exp.Expression) -> exp.Expression | None:
+    if isinstance(operand, exp.Anonymous):
+        return operand.expressions[0] if operand.expressions else None
+    this = operand.args.get("this")
+    return this if isinstance(this, exp.Expression) else None
+
+
+def _gv005_expr_is_temporal(expr: exp.Expression | None, dialect: str) -> bool:
+    if expr is None:
+        return False
+    if expr.type is not None and expr.type.is_type(*_GV005_DATE_TYPES):
+        return True
+    return _gv005_is_date(expr, dialect)
+
+
+def _gv005_strftime_has_directive(operand: exp.Expression) -> bool:
+    fmt = _gv005_format_arg(operand)
+    return True if fmt is None else bool(_GV005_STRFTIME_DIRECTIVE.search(re.sub(r"%%", "", fmt)))
+
+
+def _gv005_is_date(operand: exp.Expression | exp.Func, dialect: str = "duckdb") -> bool:
+    if _GV005_TOCHAR_TYPES and isinstance(operand, _GV005_TOCHAR_TYPES):
+        # Postgres and Snowflake parse TO_CHAR(...) as TimeToStr; in other dialects TimeToStr
+        # represents strftime / FORMAT_TIMESTAMP / FORMAT_DATE (never numeric TO_CHAR).
+        time_to_str = getattr(exp, "TimeToStr", None)
+        if time_to_str is not None and isinstance(operand, time_to_str) and dialect not in {"postgres", "snowflake"}:
+            return _gv005_strftime_has_directive(operand)
+        temporal_fmt = _gv005_temporal_format(_gv005_format_arg(operand))
+        if temporal_fmt is not None:
+            return temporal_fmt
+        return _gv005_expr_is_temporal(_gv005_tochar_value_arg(operand), dialect)
+    if isinstance(operand, _GV005_DATE_FUNCS):
+        return True
+    if isinstance(operand, exp.Cast):
+        return operand.to.is_type(*_GV005_DATE_TYPES)
+    if isinstance(operand, exp.Anonymous):
+        name = str(operand.name).upper()
+        if name == "TO_CHAR":
+            temporal_fmt = _gv005_temporal_format(_gv005_format_arg(operand))
+            if temporal_fmt is not None:
+                return temporal_fmt
+            return _gv005_expr_is_temporal(_gv005_tochar_value_arg(operand), dialect)
+        if name in _GV005_STRFTIME_NAMES:
+            return _gv005_strftime_has_directive(operand)
+        return name in _GV005_DATE_NAMES
+    return False
+
+
+def _gv005_fix(operand: exp.Expression | exp.Func, column: str, dialect: str) -> str:
+    """The `fix` text for a GV005 finding, chosen by what wraps the column and naming that column."""
+    if _gv005_is_date(operand, dialect):
+        return (f"Compare the raw column to a constant range, e.g. {column} >= '2024-01-01' AND "
+                f"{column} < '2024-01-02' instead of DATE({column}) = '2024-01-01'.")
+    if isinstance(operand, _GV005_ARITHMETIC):
+        return (f"Move the constant arithmetic to the other side of the comparison when types and overflow allow, "
+                f"so the filter compares the raw column {column} directly. Do not emit a concrete rewritten "
+                "comparison without knowing the column type, precision, and comparison semantics.")
+    if isinstance(operand, (exp.Upper, exp.Lower)):
+        if not isinstance(operand.this, exp.Column):
+            expr_sql = operand.sql(dialect=dialect)
+            return (f"This expression ({expr_sql}) on {column} runs on every row and forces a full scan. If "
+                    "collation and type-affinity semantics are known and preserved (in SQLite, a column without type "
+                    "affinity so numeric/string coercion does not change), store a precomputed column with the "
+                    f"transformed value ({expr_sql}) and compare it directly without changing the comparison "
+                    "operator or operand order; otherwise filter on a partition or indexed column first.")
+        func = "UPPER" if isinstance(operand, exp.Upper) else "LOWER"
+        case_desc = "upper-case" if isinstance(operand, exp.Upper) else "lower-case"
+        return (f"{func}({column}) runs on every row and forces a full scan. If collation and type-affinity "
+                f"semantics are known and preserved (in SQLite, a column without type affinity so numeric/string "
+                f"coercion does not change), store a precomputed {case_desc} copy of {column} ({func}({column})) "
+                "and compare it directly without changing the comparison operator or operand order; otherwise "
+                "filter on a partition or indexed column first.")
+    if isinstance(operand, exp.Trim):
+        expr_sql = operand.sql(dialect=dialect)
+        if not isinstance(operand.this, exp.Column):
+            return (f"This expression ({expr_sql}) on {column} runs on every row and forces a full scan. If "
+                    "collation and type-affinity semantics are known and preserved (in SQLite, a column without type "
+                    "affinity so numeric/string coercion does not change), store a precomputed column with the "
+                    f"transformed value ({expr_sql}) and compare it directly without changing the comparison "
+                    "operator or operand order; otherwise filter on a partition or indexed column first.")
+        return (f"{expr_sql} runs on every row and forces a full scan. If collation and type-affinity "
+                f"semantics are known and preserved (in SQLite, a column without type affinity so numeric/string "
+                f"coercion does not change), store a precomputed copy of {expr_sql} and compare it directly "
+                "without changing the comparison operator or operand order; otherwise filter on a partition or "
+                "indexed column first.")
+    if isinstance(operand, exp.Coalesce):
+        return (f"Compare the raw column {column} directly and handle NULL explicitly. Do not drop COALESCE "
+                "without checking the column type, type promotion, and collation/affinity rules: treating the "
+                "default as a literal replacement can change NULL handling, numeric/string coercion, and results "
+                "under negation.")
+    return (f"Compare the raw column {column} where possible, or filter on a partition or indexed column first "
+            "so less data is read.")
 
 
 # reading `0 < (SELECT COUNT(*) ...)` as `(SELECT COUNT(*) ...) > 0`
@@ -376,11 +559,11 @@ def lint(statement_tree: exp.Expression, dialect: str = "duckdb",
                         continue
                     cols = list(operand.find_all(exp.Column))
                     if cols and not isinstance(operand, exp.AggFunc):
+                        column = cols[0].sql(dialect=dialect)
                         add("GV005", "warn",
-                            f"The filter wraps {cols[0].sql(dialect=dialect)} in a function or calculation, which "
+                            f"The filter wraps {column} in a function or calculation, which "
                             "blocks partition pruning and min/max skipping.",
-                            "Compare the raw column to a constant range, e.g. ts >= '2024-01-01' AND "
-                            "ts < '2024-01-02' instead of DATE(ts) = '2024-01-01'.", cmp)
+                            _gv005_fix(operand, column, dialect), cmp)
                         break
 
     # GV007 exact-count-distinct
