@@ -293,7 +293,6 @@ DIALECT = Annotated[Literal["duckdb", "postgres", "bigquery", "snowflake"],
 MODELS = Annotated[str | None, Field(description="Folder with SQL models (*.sql, dbt-style refs allowed). "
                                                  "Use an absolute path.")]
 MANIFEST = Annotated[str | None, Field(description="Path to a dbt target/manifest.json (alternative to models_dir).")]
-COLS = Annotated[list[str] | None, Field(description="Column names, e.g. ['id', 'amount'].")]
 
 
 def _register_feature_tools(server: Any) -> None:

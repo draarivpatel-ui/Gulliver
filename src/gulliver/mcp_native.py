@@ -35,9 +35,6 @@ except ImportError:  # pragma: no cover - mcp 1.x: no resolvers, so no approval 
 
     HAS_ELICITATION = False
 
-STATUSES = ("ok", "warn", "block", "needs_rehearsal", "needs_approval", "skipped", "fail", "error")
-
-
 def _lean_schema(schema: dict[str, Any]) -> None:
     """Keep the outputSchema small: it is repeated for every tool in the agent's context."""
     schema.pop("description", None)
